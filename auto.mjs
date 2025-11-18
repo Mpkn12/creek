@@ -467,18 +467,74 @@ async function runAllAccounts(accounts){
   await Promise.all(workers);
 }
 
-// Entrypoint
+// ===== Entrypoint (with repeating and debug logs) =====
 (async () => {
+  const AUTO_12H = truthy(process.env.AUTO_12H ?? '0');
+  const AUTO_REPEAT_HOURS = Number(process.env.AUTO_REPEAT_HOURS ?? (AUTO_12H ? 12 : 0)) || 0;
+  const REPEAT_INTERVAL_MS = AUTO_REPEAT_HOURS > 0 ? Math.round(AUTO_REPEAT_HOURS * 60 * 60 * 1000) : 0;
+
+  log.debug('DEBUG env AUTO_12H=', process.env.AUTO_12H);
+  log.debug('DEBUG env AUTO_REPEAT_HOURS=', process.env.AUTO_REPEAT_HOURS);
+  log.debug('Computed AUTO_REPEAT_HOURS=', AUTO_REPEAT_HOURS, 'REPEAT_INTERVAL_MS=', REPEAT_INTERVAL_MS);
+
+  let shuttingDown = false;
+  function setupShutdownHandlers(){
+    const stop = (sig) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log.info(`Received ${sig} — graceful shutdown requested`);
+    };
+    process.on('SIGINT', () => stop('SIGINT'));
+    process.on('SIGTERM', () => stop('SIGTERM'));
+  }
+  setupShutdownHandlers();
+
   try {
     log.info('Auto runner (multi-account aware) starting...');
     log.info('PHASES_CFG:', PHASES_CFG.join(','));
     log.info('ACCOUNTS:', ACCOUNTS.length ? ACCOUNTS.map(a=>a.id).join(',') : '(none)');
     log.info('PARALLELISM:', PARALLELISM);
+    if (REPEAT_INTERVAL_MS > 0) {
+      log.info(`AUTO REPEAT enabled: every ${AUTO_REPEAT_HOURS} hour(s) (${REPEAT_INTERVAL_MS} ms)`);
+    } else {
+      log.info('AUTO REPEAT disabled: will run once then exit');
+    }
 
-    await runAllAccounts(ACCOUNTS);
+    let iteration = 0;
+    do {
+      iteration++;
+      log.info(`=== RUN ITERATION ${iteration} ===`);
+      try {
+        await runAllAccounts(ACCOUNTS);
+      } catch (e) {
+        if (e?.message === 'stop_on_fail') {
+          log.error('Stopped due to STOP_ON_FAIL');
+          if (!REPEAT_INTERVAL_MS) process.exit(1);
+          break;
+        }
+        log.error('RunAllAccounts failed:', e?.message || e);
+      }
+
+      if (shuttingDown) {
+        log.info('Shutdown requested — exiting loop');
+        break;
+      }
+
+      if (REPEAT_INTERVAL_MS > 0) {
+        log.info(`Sleeping ${REPEAT_INTERVAL_MS}ms until next run (iteration ${iteration + 1})`);
+        const sleepUntil = Date.now() + REPEAT_INTERVAL_MS;
+        while (!shuttingDown && Date.now() < sleepUntil) {
+          const remaining = Math.min(1000 * 30, sleepUntil - Date.now());
+          if (remaining > 0) await sleep(remaining);
+        }
+      }
+    } while (!shuttingDown && REPEAT_INTERVAL_MS > 0);
+
+    log.info('Runner finished, exiting');
     process.exit(0);
   } catch (e) {
     log.error('FATAL:', e.message || e);
     process.exit(1);
   }
 })();
+
